@@ -11,3 +11,8 @@ node_modules/
 .DS_Store
 *.swp
 *.log
+
+# 手工备份（现在有 git 了，不需要）
+*.bak
+*.bak.*
+*.bak-*
