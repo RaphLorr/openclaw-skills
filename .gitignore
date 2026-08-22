@@ -1,0 +1,13 @@
+# 白名单：默认忽略全部，只跟踪自己写的 3 个 skill
+/*
+!.gitignore
+!README.md
+!contact-map-manager/
+!reminder/
+!tapd/
+
+# 依赖与杂项
+node_modules/
+.DS_Store
+*.swp
+*.log
