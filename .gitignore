@@ -1,10 +1,12 @@
-# 白名单：默认忽略全部，只跟踪自己写的 3 个 skill
+# 白名单：默认忽略全部，只跟踪自己写的 skill
+# 新增 skill 必须在这里显式放行，否则 git 看不见它
 /*
 !.gitignore
 !README.md
 !contact-map-manager/
 !reminder/
 !tapd/
+!wecom-api/
 
 # 依赖与杂项
 node_modules/
@@ -16,3 +18,7 @@ node_modules/
 *.bak
 *.bak.*
 *.bak-*
+
+# Python 运行产物
+__pycache__/
+*.pyc
