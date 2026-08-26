@@ -15,6 +15,7 @@
 """
 import argparse
 import fcntl
+import http.client
 import json
 import os
 import subprocess
@@ -335,18 +336,34 @@ def load_egress_profile(name):
     return profile
 
 
-def egress_proxy_url(name, profile):
+def local_addresses():
+    rc, output = run_step(["ip", "-4", "-o", "addr", "show"], timeout=10)
+    if rc != 0:
+        return set()
+    return {part.split("/")[0] for line in output.splitlines()
+            for i, part in enumerate(line.split()) if part == "inet"
+            for part in [line.split()[i + 1]]}
+
+
+def egress_transport(name, profile):
+    """出口档案 → 传输方式。两种：绑定本地源地址，或走 HTTP 代理。
+
+    绑源地址是首选：IPsec 的出向策略按源地址匹配（src <虚拟IP> dst 0.0.0.0/0），
+    所以「绑定哪个本地地址」就等于「走不走隧道」。不需要额外的代理进程。
+    """
+    source_ip = (profile.get("source_ip") or "").strip()
+    if source_ip:
+        return {"source_ip": source_ip}
+
     url = (profile.get("url") or "").strip()
     if not url:
-        raise WecomError("出口 %r 没有 url" % name)
+        raise WecomError("出口 %r 既没有 source_ip 也没有 url" % name)
     if not url.startswith("http://"):
-        # 标准库只会 HTTP 代理，SOCKS 得先用 xray 之类的转成 HTTP 入口。
         raise WecomError(
-            "出口 %r 的 url 是 %r——只支持 http:// 代理。\n"
-            "SOCKS 隧道请用 xray/privoxy 转成 HTTP 入口再填这里（脚本只依赖标准库）。"
+            "出口 %r 的 url 是 %r——只支持 http:// 代理（脚本只依赖标准库，不会 SOCKS）。"
             % (name, url)
         )
-    return url
+    return {"proxy": url}
 
 
 class EgressLock:
@@ -417,9 +434,9 @@ def acquire_egress(name):
     if profile.get("type") == "direct":
         return None
 
-    url = egress_proxy_url(name, profile)
+    transport = egress_transport(name, profile)
     if not profile.get("up"):
-        return url  # 常驻线路，不需要拨号
+        return transport  # 常驻线路，不需要拨号
 
     with EgressLock(EGRESS_LOCK):
         if not egress_is_up(profile):
@@ -432,10 +449,20 @@ def acquire_egress(name):
                     "%s\n提示：账号是共享单会话的，可能有人正占着。"
                     % (name, rc, output.strip()[:500])
                 )
+        # 拨上了还要确认源地址真的在本机——地址不在就绑不上，而绑不上
+        # 又不能退回默认源地址（那就从错误的 IP 发出去了）。
+        source_ip = transport.get("source_ip")
+        if source_ip and source_ip not in local_addresses():
+            audit("egress missing-source name=%s ip=%s" % (name, source_ip))
+            raise WecomError(
+                "出口 %r 已拨通，但本机没有地址 %s——网关这次分配的虚拟 IP 可能变了。\n"
+                "用 `ip -4 -o addr show` 看实际拿到的地址，再更新出口配置的 source_ip。"
+                % (name, source_ip)
+            )
         state = read_egress_state()
         state[name] = {**(state.get(name) or {}), "last_used": time.time()}
         write_private(EGRESS_STATE, state)
-    return url
+    return transport
 
 
 def touch_egress(name):
@@ -454,26 +481,50 @@ def touch_egress(name):
 
 # ---------------------------------------------------------------- HTTP
 
-def http_json(method, url, payload=None, timeout=30, proxy=None):
+def build_opener(transport):
+    """按出口方式造 opener。ProxyHandler({}) 是刻意的——挡掉环境里的
+    HTTPS_PROXY，否则会莫名其妙继承 codex 那条德国线路。"""
+    transport = transport or {}
+    source_ip = transport.get("source_ip")
+    if source_ip:
+        class BoundHTTPSConnection(http.client.HTTPSConnection):
+            def __init__(self, *args, **kwargs):
+                kwargs["source_address"] = (source_ip, 0)
+                super().__init__(*args, **kwargs)
+
+        class BoundHTTPSHandler(urllib.request.HTTPSHandler):
+            def https_open(self, req):
+                return self.do_open(BoundHTTPSConnection, req)
+
+        return urllib.request.build_opener(
+            urllib.request.ProxyHandler({}), BoundHTTPSHandler()
+        )
+
+    proxy = transport.get("proxy")
+    if proxy:
+        return urllib.request.build_opener(
+            urllib.request.ProxyHandler({"http": proxy, "https": proxy})
+        )
+    return urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def http_json(method, url, payload=None, timeout=30, transport=None):
     data = json.dumps(payload).encode("utf-8") if payload is not None else None
     request = urllib.request.Request(url, data=data, method=method)
     if data is not None:
         request.add_header("Content-Type", "application/json")
 
-    # 声明了出口就必须走它。绝不在代理不可用时静默退回直连——
+    # 声明了出口就必须走它。绝不在出口不可用时静默退回直连——
     # 那等于用错误的源 IP 发出请求，撞上别的应用的白名单，问题更难查。
-    handlers = [urllib.request.ProxyHandler({"http": proxy, "https": proxy})] if proxy \
-        else [urllib.request.ProxyHandler({})]
-    opener = urllib.request.build_opener(*handlers)
-
+    opener = build_opener(transport)
     try:
         with opener.open(request, timeout=timeout) as response:
             body = response.read().decode("utf-8", "replace")
     except urllib.error.HTTPError as err:
         raise WecomError("HTTP %s：%s" % (err.code, err.reason))
     except urllib.error.URLError as err:
-        hint = "（出口代理 %s 连不上？）" % proxy if proxy else ""
-        raise WecomError("请求失败：%s%s" % (err.reason, hint))
+        where = (transport or {}).get("source_ip") or (transport or {}).get("proxy") or ""
+        raise WecomError("请求失败：%s%s" % (err.reason, ("（出口 %s）" % where) if where else ""))
     try:
         return json.loads(body)
     except ValueError:
@@ -500,7 +551,7 @@ def write_private(path, payload):
     os.replace(temp, path)
 
 
-def get_token(corpid, agentid, proxy=None):
+def get_token(corpid, agentid, transport=None):
     """带缓存的 access_token。缓存文件 600，提前 5 分钟过期以免边界失败。"""
     key = "%s:%s" % (corpid, agentid)
     cache = {}
@@ -519,7 +570,7 @@ def get_token(corpid, agentid, proxy=None):
         API_BASE,
         urllib.parse.urlencode({"corpid": corpid, "corpsecret": secret}),
     )
-    result = http_json("GET", url, proxy=proxy)
+    result = http_json("GET", url, transport=transport)
     if result.get("errcode"):
         raise WecomError(
             "取 token 失败：errcode=%s errmsg=%s（检查 secret 是否属于该应用、"
@@ -575,19 +626,19 @@ def api_call(corpid, agentid, method, path, params=None, payload=None,
             "确属只读的话别硬加，先用 specfusion 确认再把它加进 READ_EXCEPTIONS。）" % path
         )
 
-    proxy = acquire_egress(egress)
+    transport = acquire_egress(egress)
 
     # 先记再打——取 token 失败也是一次真实尝试，不能因为失败就不留痕。
     audit("attempt resolve=%s chat=%s corp=%s agent=%s egress=%s %s %s write=%s"
           % (resolution, chat_id or "-", corpid, agentid, egress or "direct",
              method, path, allow_write))
 
-    token = get_token(corpid, agentid, proxy=proxy)
+    token = get_token(corpid, agentid, transport=transport)
     query = dict(params or {})
     query["access_token"] = token
     url = "%s%s?%s" % (API_BASE, path, urllib.parse.urlencode(query))
     try:
-        result = http_json(method, url, payload, proxy=proxy)
+        result = http_json(method, url, payload, transport=transport)
     finally:
         touch_egress(egress)
     if result.get("errcode"):
@@ -837,9 +888,13 @@ def cmd_doctor(args):
             print("  （空）——全部直连")
         for name in sorted(profiles):
             profile = profiles[name] or {}
-            print("  - %-22s %s  %s"
-                  % (name, profile.get("url") or profile.get("type") or "?",
-                     profile.get("note") or ""))
+            where = profile.get("source_ip") or profile.get("url") or profile.get("type") or "?"
+            dial = "按需拨号" if profile.get("up") else "常驻"
+            live = ""
+            if profile.get("source_ip"):
+                live = "（地址在本机）" if profile["source_ip"] in local_addresses() else "（地址不在本机→未拨通）"
+            print("  - %-22s %-16s %s %s %s"
+                  % (name, where, dial, live, profile.get("note") or ""))
     except WecomError:
         print("  （不存在）——全部直连。要按应用绑定出口时才需要建。")
 
