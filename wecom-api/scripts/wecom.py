@@ -45,6 +45,10 @@ CONTEXT_MAP = _path("WECOM_CONTEXT_MAP", "workspace", "data", "project_context_m
 CREDENTIALS = _path("WECOM_CREDENTIALS", "credentials", "wecom-credentials.json")
 TOKEN_CACHE = _path("WECOM_TOKEN_CACHE", "credentials", "wecom-token-cache.json")
 
+# 出口档案：把「哪个应用走哪条线路出网」和线路本身解耦。
+# 可能带代理认证信息，所以跟凭据同级同权限。
+EGRESS = _path("WECOM_EGRESS", "credentials", "wecom-egress.json")
+
 # 审计日志不是密钥，丢了也不影响功能，放 logs（700）。
 AUDIT_LOG = _path("WECOM_AUDIT_LOG", "logs", "wecom-audit.log")
 
@@ -236,6 +240,21 @@ def project_wecom_issues(project):
         if not str(entry.get("agentid") or "").strip():
             issues.append("环境 %r 缺 agentid" % name)
 
+    known_egress = set()
+    try:
+        known_egress = set(read_json(EGRESS, "出口配置"))
+    except WecomError:
+        pass  # 没有出口配置文件是合法的，代表全部直连
+    for name in sorted(envs):
+        entry = envs[name]
+        if not isinstance(entry, dict):
+            continue
+        egress = (entry.get("egress") or "").strip()
+        if egress and egress != "direct" and egress not in known_egress:
+            issues.append(
+                "环境 %r 引用了出口 %r，但出口配置里没有它——调用会直接失败" % (name, egress)
+            )
+
     default = wecom.get("default")
     if not default:
         issues.append("`wecom.default` 未设——每次调用都得显式 --env")
@@ -259,7 +278,7 @@ def write_shared(path, payload):
 
 
 def resolve_env(project, env_name=None):
-    """(env 名, corpid, agentid, label)。默认环境由配置决定，不由模型猜。"""
+    """(env 名, corpid, agentid, label, egress 名)。默认环境由配置决定，不由模型猜。"""
     wecom = project.get("wecom") or {}
     environments = wecom.get("environments") or {}
     if not environments:
@@ -282,7 +301,7 @@ def resolve_env(project, env_name=None):
     agentid = str(entry.get("agentid") or "").strip()
     if not corpid or not agentid:
         raise WecomError("环境 %r 缺 corpid 或 agentid" % name)
-    return name, corpid, agentid, entry.get("label") or name
+    return name, corpid, agentid, entry.get("label") or name, entry.get("egress") or ""
 
 
 def load_secret(corpid, agentid):
@@ -298,20 +317,61 @@ def load_secret(corpid, agentid):
     return secret
 
 
+# ---------------------------------------------------------------- 出口线路
+
+def resolve_egress(name):
+    """把环境声明的出口名解析成代理 URL。返回 None 表示直连。
+
+    每个企微应用的 IP 白名单不同，所以「从哪个 IP 发出去」是应用的属性，
+    必须能按环境分别指定。隧道本身由运维搭好并落地成一个本地代理端口，
+    这里只负责选端口——这样不用动系统路由，也就不会波及 SSH 和别的服务。
+    """
+    if not name or name == "direct":
+        return None
+    profiles = read_json(EGRESS, "出口配置")
+    profile = profiles.get(name)
+    if not isinstance(profile, dict):
+        raise WecomError(
+            "出口配置里没有 %r。已配置：%s\n配置文件：%s"
+            % (name, ", ".join(sorted(profiles)) or "（空）", EGRESS)
+        )
+    if profile.get("type") == "direct":
+        return None
+    url = (profile.get("url") or "").strip()
+    if not url:
+        raise WecomError("出口 %r 没有 url" % name)
+    if not url.startswith("http://"):
+        # 标准库只会 HTTP 代理，SOCKS 得先用 xray 之类的转成 HTTP 入口。
+        raise WecomError(
+            "出口 %r 的 url 是 %r——只支持 http:// 代理。\n"
+            "SOCKS 隧道请用 xray/privoxy 转成 HTTP 入口再填这里（脚本只依赖标准库）。"
+            % (name, url)
+        )
+    return url
+
+
 # ---------------------------------------------------------------- HTTP
 
-def http_json(method, url, payload=None, timeout=30):
+def http_json(method, url, payload=None, timeout=30, proxy=None):
     data = json.dumps(payload).encode("utf-8") if payload is not None else None
     request = urllib.request.Request(url, data=data, method=method)
     if data is not None:
         request.add_header("Content-Type", "application/json")
+
+    # 声明了出口就必须走它。绝不在代理不可用时静默退回直连——
+    # 那等于用错误的源 IP 发出请求，撞上别的应用的白名单，问题更难查。
+    handlers = [urllib.request.ProxyHandler({"http": proxy, "https": proxy})] if proxy \
+        else [urllib.request.ProxyHandler({})]
+    opener = urllib.request.build_opener(*handlers)
+
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with opener.open(request, timeout=timeout) as response:
             body = response.read().decode("utf-8", "replace")
     except urllib.error.HTTPError as err:
         raise WecomError("HTTP %s：%s" % (err.code, err.reason))
     except urllib.error.URLError as err:
-        raise WecomError("请求失败：%s" % err.reason)
+        hint = "（出口代理 %s 连不上？）" % proxy if proxy else ""
+        raise WecomError("请求失败：%s%s" % (err.reason, hint))
     try:
         return json.loads(body)
     except ValueError:
@@ -338,7 +398,7 @@ def write_private(path, payload):
     os.replace(temp, path)
 
 
-def get_token(corpid, agentid):
+def get_token(corpid, agentid, proxy=None):
     """带缓存的 access_token。缓存文件 600，提前 5 分钟过期以免边界失败。"""
     key = "%s:%s" % (corpid, agentid)
     cache = {}
@@ -357,7 +417,7 @@ def get_token(corpid, agentid):
         API_BASE,
         urllib.parse.urlencode({"corpid": corpid, "corpsecret": secret}),
     )
-    result = http_json("GET", url)
+    result = http_json("GET", url, proxy=proxy)
     if result.get("errcode"):
         raise WecomError(
             "取 token 失败：errcode=%s errmsg=%s（检查 secret 是否属于该应用、"
@@ -403,7 +463,7 @@ def is_mutating(path):
 
 
 def api_call(corpid, agentid, method, path, params=None, payload=None,
-             allow_write=False, resolution="?", chat_id=""):
+             allow_write=False, resolution="?", chat_id="", egress=""):
     if not path.startswith("/"):
         path = "/" + path
     if is_mutating(path) and not allow_write:
@@ -413,15 +473,18 @@ def api_call(corpid, agentid, method, path, params=None, payload=None,
             "确属只读的话别硬加，先用 specfusion 确认再把它加进 READ_EXCEPTIONS。）" % path
         )
 
-    # 先记再打——取 token 失败也是一次真实尝试，不能因为失败就不留痕。
-    audit("attempt resolve=%s chat=%s corp=%s agent=%s %s %s write=%s"
-          % (resolution, chat_id or "-", corpid, agentid, method, path, allow_write))
+    proxy = resolve_egress(egress)
 
-    token = get_token(corpid, agentid)
+    # 先记再打——取 token 失败也是一次真实尝试，不能因为失败就不留痕。
+    audit("attempt resolve=%s chat=%s corp=%s agent=%s egress=%s %s %s write=%s"
+          % (resolution, chat_id or "-", corpid, agentid, egress or "direct",
+             method, path, allow_write))
+
+    token = get_token(corpid, agentid, proxy=proxy)
     query = dict(params or {})
     query["access_token"] = token
     url = "%s%s?%s" % (API_BASE, path, urllib.parse.urlencode(query))
-    result = http_json(method, url, payload)
+    result = http_json(method, url, payload, proxy=proxy)
     if result.get("errcode"):
         raise WecomError(
             "接口返回错误：errcode=%s errmsg=%s\n路径：%s\n"
@@ -438,7 +501,7 @@ def cmd_call(args):
     project, resolution = find_project(
         read_json(CONTEXT_MAP, "项目上下文"), args.project, args.chat_id, args.unbound
     )
-    env_name, corpid, agentid, label = resolve_env(project, args.env)
+    env_name, corpid, agentid, label, egress = resolve_env(project, args.env)
 
     params = {}
     for item in args.param or []:
@@ -457,7 +520,7 @@ def cmd_call(args):
     result = api_call(
         corpid, agentid, args.method.upper(), args.path,
         params=params, payload=payload, allow_write=args.allow_write,
-        resolution=resolution, chat_id=args.chat_id or "",
+        resolution=resolution, chat_id=args.chat_id or "", egress=egress,
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
@@ -469,10 +532,10 @@ def cmd_call(args):
     # 不在 params 里，所以这行不会带出凭据。
     query = ("?" + urllib.parse.urlencode(params)) if params else ""
     print()
-    print("（发出：%s %s%s ｜ 项目 %s（%s）｜ 环境 %s / %s，应用 %s）"
+    print("（发出：%s %s%s ｜ 项目 %s（%s）｜ 环境 %s / %s，应用 %s ｜ 出口 %s）"
           % (args.method.upper(), args.path, query, project.get("id"),
-             "会话绑定" if resolution == "bound" else "⚠️ 未经绑定",
-             env_name, label, agentid))
+             "会话绑定" if resolution.startswith("bound") else "⚠️ 未经绑定",
+             env_name, label, agentid, egress or "直连"))
 
 
 def cmd_env(args):
@@ -494,9 +557,10 @@ def cmd_env(args):
                 has_secret = True
             except WecomError:
                 pass
-            print("  - %-6s %s  应用 %s  %s  secret：%s"
+            print("  - %-6s %s  应用 %s  %s  secret：%s  出口：%s"
                   % (name, corpid, agentid, entry.get("label") or "",
-                     "已配置" if has_secret else "缺失"))
+                     "已配置" if has_secret else "缺失",
+                     entry.get("egress") or "直连"))
         chats = [c.get("chat_id") for c in (context_map.get("contexts") or [])
                  if project.get("id") in (c.get("project_ids") or [])]
         print("  关联会话：%s" % (", ".join(chats) if chats else "（无）"))
@@ -520,6 +584,8 @@ def cmd_bind(args):
     entry = {"corpid": args.corpid.strip(), "agentid": str(args.agentid).strip()}
     if args.label:
         entry["label"] = args.label
+    if args.egress:
+        entry["egress"] = args.egress.strip()
 
     dropped = []
 
@@ -602,6 +668,21 @@ def cmd_doctor(args):
     cmd_env(args)
 
     print()
+    print("======== 出口线路 ========")
+    print("  配置文件：%s" % EGRESS)
+    try:
+        profiles = read_json(EGRESS, "出口配置")
+        if not profiles:
+            print("  （空）——全部直连")
+        for name in sorted(profiles):
+            profile = profiles[name] or {}
+            print("  - %-22s %s  %s"
+                  % (name, profile.get("url") or profile.get("type") or "?",
+                     profile.get("note") or ""))
+    except WecomError:
+        print("  （不存在）——全部直连。要按应用绑定出口时才需要建。")
+
+    print()
     print("======== 结构体检 ========")
     context_map = read_json(CONTEXT_MAP, "项目上下文")
     problems = 0
@@ -662,6 +743,11 @@ def build_parser():
     bind.add_argument("--corpid", required=True)
     bind.add_argument("--agentid", required=True)
     bind.add_argument("--label", help="人看的名字，如「测试应用」")
+    bind.add_argument(
+        "--egress",
+        help="出口档案名（见 wecom-egress.json）。不填即直连。"
+             "企微白名单是按应用配的，不同应用可能要走不同线路",
+    )
     bind.add_argument("--make-default", action="store_true", help="把这个环境设为默认")
     bind.add_argument(
         "--drop-legacy", action="store_true",
