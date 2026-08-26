@@ -14,8 +14,10 @@
 - 只依赖标准库：服务器上没有 npm，也别假设 pip 装得上东西。
 """
 import argparse
+import fcntl
 import json
 import os
+import subprocess
 import sys
 import time
 import urllib.error
@@ -48,6 +50,9 @@ TOKEN_CACHE = _path("WECOM_TOKEN_CACHE", "credentials", "wecom-token-cache.json"
 # 出口档案：把「哪个应用走哪条线路出网」和线路本身解耦。
 # 可能带代理认证信息，所以跟凭据同级同权限。
 EGRESS = _path("WECOM_EGRESS", "credentials", "wecom-egress.json")
+
+EGRESS_STATE = _path("WECOM_EGRESS_STATE", "credentials", "wecom-egress-state.json")
+EGRESS_LOCK = _path("WECOM_EGRESS_LOCK", "credentials", "wecom-egress.lock")
 
 # 审计日志不是密钥，丢了也不影响功能，放 logs（700）。
 AUDIT_LOG = _path("WECOM_AUDIT_LOG", "logs", "wecom-audit.log")
@@ -319,15 +324,7 @@ def load_secret(corpid, agentid):
 
 # ---------------------------------------------------------------- 出口线路
 
-def resolve_egress(name):
-    """把环境声明的出口名解析成代理 URL。返回 None 表示直连。
-
-    每个企微应用的 IP 白名单不同，所以「从哪个 IP 发出去」是应用的属性，
-    必须能按环境分别指定。隧道本身由运维搭好并落地成一个本地代理端口，
-    这里只负责选端口——这样不用动系统路由，也就不会波及 SSH 和别的服务。
-    """
-    if not name or name == "direct":
-        return None
+def load_egress_profile(name):
     profiles = read_json(EGRESS, "出口配置")
     profile = profiles.get(name)
     if not isinstance(profile, dict):
@@ -335,8 +332,10 @@ def resolve_egress(name):
             "出口配置里没有 %r。已配置：%s\n配置文件：%s"
             % (name, ", ".join(sorted(profiles)) or "（空）", EGRESS)
         )
-    if profile.get("type") == "direct":
-        return None
+    return profile
+
+
+def egress_proxy_url(name, profile):
     url = (profile.get("url") or "").strip()
     if not url:
         raise WecomError("出口 %r 没有 url" % name)
@@ -348,6 +347,109 @@ def resolve_egress(name):
             % (name, url)
         )
     return url
+
+
+class EgressLock:
+    """跨进程串行化拨号/挂断。同一时刻只允许一个进程动隧道状态。"""
+
+    def __init__(self, path):
+        self.path = path
+        self.handle = None
+
+    def __enter__(self):
+        ensure_private_dir(self.path)
+        self.handle = open(self.path, "a+")
+        fcntl.flock(self.handle, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *_):
+        try:
+            fcntl.flock(self.handle, fcntl.LOCK_UN)
+        finally:
+            self.handle.close()
+
+
+def read_egress_state():
+    if not os.path.exists(EGRESS_STATE):
+        return {}
+    try:
+        return read_json(EGRESS_STATE, "出口状态")
+    except WecomError:
+        return {}
+
+
+def run_step(command, timeout=90):
+    """跑一条 up/down/status 命令。返回 (rc, 合并输出)。"""
+    if isinstance(command, str):
+        command = command.split()
+    try:
+        done = subprocess.run(command, capture_output=True, text=True, timeout=timeout)
+        return done.returncode, (done.stdout or "") + (done.stderr or "")
+    except FileNotFoundError:
+        raise WecomError("找不到命令 %r——VPN 客户端装了吗？" % command[0])
+    except subprocess.TimeoutExpired:
+        return 124, "超时（%ds）" % timeout
+
+
+def egress_is_up(profile):
+    """靠 status 命令的输出判断，不靠自己记的状态——隧道可能被别处踢断。"""
+    status = profile.get("status")
+    if not status:
+        return False
+    pattern = profile.get("ready_pattern") or "ESTABLISHED"
+    _, output = run_step(status, timeout=20)
+    return pattern in output
+
+
+def acquire_egress(name):
+    """确保出口可用，返回代理 URL。直连返回 None。
+
+    按需拨号带空闲窗口：首次调用拨号，之后的调用复用同一条隧道，
+    静默超过 idle_seconds 后由 `egress-reap` 挂断。
+
+    为什么不是每次调用都拨：agent 一个 turn 常常连调几个接口，
+    每次握手要几秒，而且 VPN 账号是共享的、单会话——拨号次数越多，
+    把同事踢下线（或被同事踢掉）的窗口就越多。
+    """
+    if not name or name == "direct":
+        return None
+    profile = load_egress_profile(name)
+    if profile.get("type") == "direct":
+        return None
+
+    url = egress_proxy_url(name, profile)
+    if not profile.get("up"):
+        return url  # 常驻线路，不需要拨号
+
+    with EgressLock(EGRESS_LOCK):
+        if not egress_is_up(profile):
+            audit("egress dial name=%s" % name)
+            rc, output = run_step(profile["up"], timeout=int(profile.get("dial_timeout") or 90))
+            if rc != 0 or not egress_is_up(profile):
+                audit("egress dial-failed name=%s rc=%s" % (name, rc))
+                raise WecomError(
+                    "出口 %r 拨号失败（rc=%s）。绝不退回直连——那会用错误的源 IP 发请求。\n"
+                    "%s\n提示：账号是共享单会话的，可能有人正占着。"
+                    % (name, rc, output.strip()[:500])
+                )
+        state = read_egress_state()
+        state[name] = {**(state.get(name) or {}), "last_used": time.time()}
+        write_private(EGRESS_STATE, state)
+    return url
+
+
+def touch_egress(name):
+    """请求结束后续命，让空闲窗口从最后一次使用开始算。"""
+    if not name or name == "direct":
+        return
+    try:
+        with EgressLock(EGRESS_LOCK):
+            state = read_egress_state()
+            if name in state:
+                state[name] = {**state[name], "last_used": time.time()}
+                write_private(EGRESS_STATE, state)
+    except OSError:
+        pass
 
 
 # ---------------------------------------------------------------- HTTP
@@ -473,7 +575,7 @@ def api_call(corpid, agentid, method, path, params=None, payload=None,
             "确属只读的话别硬加，先用 specfusion 确认再把它加进 READ_EXCEPTIONS。）" % path
         )
 
-    proxy = resolve_egress(egress)
+    proxy = acquire_egress(egress)
 
     # 先记再打——取 token 失败也是一次真实尝试，不能因为失败就不留痕。
     audit("attempt resolve=%s chat=%s corp=%s agent=%s egress=%s %s %s write=%s"
@@ -484,7 +586,10 @@ def api_call(corpid, agentid, method, path, params=None, payload=None,
     query = dict(params or {})
     query["access_token"] = token
     url = "%s%s?%s" % (API_BASE, path, urllib.parse.urlencode(query))
-    result = http_json(method, url, payload, proxy=proxy)
+    try:
+        result = http_json(method, url, payload, proxy=proxy)
+    finally:
+        touch_egress(egress)
     if result.get("errcode"):
         raise WecomError(
             "接口返回错误：errcode=%s errmsg=%s\n路径：%s\n"
@@ -633,6 +738,62 @@ def cmd_bind(args):
           % (sys.argv[0], entry["corpid"], entry["agentid"]))
 
 
+def cmd_egress_reap(args):
+    """挂断空闲超时的按需隧道。由 systemd timer / cron 定期调用。
+
+    共享账号是单会话的，隧道多挂一秒就多占一秒别人的名额，所以空闲就要还回去。
+    """
+    try:
+        profiles = read_json(EGRESS, "出口配置")
+    except WecomError:
+        print("没有出口配置，无事可做。")
+        return
+
+    now = time.time()
+    with EgressLock(EGRESS_LOCK):
+        state = read_egress_state()
+        remaining = dict(state)
+        for name, profile in sorted(profiles.items()):
+            if not isinstance(profile, dict) or not profile.get("down"):
+                continue
+            idle_limit = int(profile.get("idle_seconds") or 120)
+            last_used = (state.get(name) or {}).get("last_used") or 0
+            idle = now - last_used
+            if not egress_is_up(profile):
+                remaining.pop(name, None)
+                continue
+            if idle < idle_limit:
+                print("%s：在用（空闲 %ds < %ds），保持连接" % (name, idle, idle_limit))
+                continue
+            rc, output = run_step(profile["down"], timeout=30)
+            audit("egress hangup name=%s idle=%ds rc=%s" % (name, idle, rc))
+            remaining.pop(name, None)
+            print("%s：空闲 %ds，已挂断（rc=%s）%s"
+                  % (name, idle, rc, ("  " + output.strip()[:120]) if rc else ""))
+        write_private(EGRESS_STATE, remaining)
+
+
+def cmd_egress_status(args):
+    try:
+        profiles = read_json(EGRESS, "出口配置")
+    except WecomError:
+        print("没有出口配置——全部直连。")
+        return
+    state = read_egress_state()
+    now = time.time()
+    for name in sorted(profiles):
+        profile = profiles[name] or {}
+        if not profile.get("up"):
+            print("  %-22s 常驻  %s" % (name, profile.get("url") or ""))
+            continue
+        up = egress_is_up(profile)
+        last_used = (state.get(name) or {}).get("last_used")
+        idle = ("空闲 %ds" % int(now - last_used)) if last_used else "无记录"
+        print("  %-22s %s  %s  空闲上限 %ss  %s"
+              % (name, "已连接" if up else "未连接", idle,
+                 profile.get("idle_seconds") or 120, profile.get("url") or ""))
+
+
 def cmd_set_secret(args):
     """secret 从标准输入读，不走命令行参数——argv 会进 ps 和 shell history。"""
     secret = sys.stdin.read().strip()
@@ -754,6 +915,12 @@ def build_parser():
         help="顺手删掉该项目下失效的旧键名（wecom_app 之类）。写前会备份",
     )
     bind.set_defaults(func=cmd_bind)
+
+    reap = subparsers.add_parser("egress-reap", help="挂断空闲超时的按需隧道（给定时器调用）")
+    reap.set_defaults(func=cmd_egress_reap)
+
+    egstatus = subparsers.add_parser("egress-status", help="看各条出口现在连着没")
+    egstatus.set_defaults(func=cmd_egress_status)
 
     set_secret = subparsers.add_parser("set-secret", help="从标准输入写入应用 secret")
     set_secret.add_argument("--corpid", required=True)
