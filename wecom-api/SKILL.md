@@ -169,31 +169,57 @@ python3 $S call POST /cgi-bin/externalcontact/batch/get_by_user \
 
 ## 配置流程（管理员在私聊里说"配置企微"时）
 
-1. 跟管理员要三个值：**corpid**、**应用 agentid**、项目 id。
-   这三个都不是密钥，可以在聊天里说。
-2. 编辑 `project_context_map.json`，在对应项目下加：
+**绝对不要手改 `project_context_map.json` 里的 wecom 结构。** 用 `bind` 命令。
 
-```json
-"wecom": {
-  "default": "test",
-  "environments": {
-    "test": { "corpid": "ww……", "agentid": "1000002", "label": "测试应用" }
-  }
-}
+手拼 JSON 出过事：曾经把配置写成了 `wecom_app` 这个键名、而且是扁平结构，
+看起来配好了、实际脚本一个字都读不到——**静默失效比报错难查得多**。
+结构该由命令保证，不该由你照着模板拼。
+
+### 1. 跟管理员要三个值
+
+**corpid**、**应用 agentid**、**项目 id**。三个都不是密钥，可以在聊天里说。
+
+### 2. 写配置
+
+```bash
+python3 $S bind --project <项目id> --env test \
+  --corpid ww…… --agentid 1000002 --label "测试应用"
 ```
 
-再加环境就在 `environments` 里并排加一个，`default` 保持指向最安全的那个。
+写前自动备份，写后自动体检并把结果打给你。再加环境就再跑一次，换个 `--env` 名字。
+`--make-default` 改默认环境；`--drop-legacy` 顺手清掉历史遗留的错键名。
 
-3. **secret 绝不能在聊天里传。** 如果管理员直接把 secret 发过来了，告诉他：
-   这条消息会留在微信聊天记录、E云的服务器、以及本机的会话存档里，**建议作废重置**，
-   然后让他用下面这条命令自己写（secret 走标准输入，不进命令行也不进 shell history）：
+### 3. 绑定会话
+
+`bind` 只管项目的企微配置，**不管哪个会话能用它**。会话绑定在
+`project_context_map.json` 的 `contexts` 里：
+
+```json
+{ "chat_id": "openclaw-weixin:group:xxx@chatroom", "project_ids": ["<项目id>"] }
+{ "chat_id": "openclaw-weixin:direct:<wxid>",      "project_ids": ["<项目id>"] }
+```
+
+没有这条，配了 corpid 也调不通——这是有意的，见上面的授权规则。
+
+### 4. secret 绝不能在聊天里传
+
+如果管理员直接把 secret 发过来了，告诉他：这条消息会留在微信聊天记录、
+E云的服务器、以及本机的会话存档里，**建议作废重置**，然后让他自己跑
+（secret 走标准输入，不进命令行也不进 shell history）：
 
 ```bash
 echo -n '<secret>' | python3 ~/.openclaw/workspace/skills/wecom-api/scripts/wecom.py \
   set-secret --corpid ww…… --agentid 1000002
 ```
 
-4. 跑 `python3 $S doctor` 确认接线，再随便 `call` 一个只读接口验证凭据真的能用。
+### 5. 验收
+
+跑 `python3 $S doctor`，必须满足两条：
+
+- **结构体检**没有 ⚠️
+- 对应环境的 **secret 显示「已配置」**
+
+然后随便 `call` 一个只读接口，确认凭据真的能用。
 
 ## 排错
 

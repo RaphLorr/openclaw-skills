@@ -197,6 +197,67 @@ def find_project(context_map, project_id=None, chat_id=None, unbound=False):
     return project, "bound-dm" if is_dm else "bound"
 
 
+# 模型手拼 JSON 时常见的近似键名。它们不会被读到，但看起来"配好了"——
+# 静默失效比报错更难查，所以体检时必须点名。
+NEAR_MISS_KEYS = ("wecom_app", "wecomApp", "wecom-app", "wecom_config", "qywx", "wework")
+
+
+def project_wecom_issues(project):
+    """列出这个项目 wecom 配置的结构性问题。空列表 = 结构合法。"""
+    issues = []
+    for key in NEAR_MISS_KEYS:
+        if key in project:
+            issues.append("有 `%s` 字段——脚本只读 `wecom`，这个键名不会生效" % key)
+
+    wecom = project.get("wecom")
+    if wecom is None:
+        return issues
+    if not isinstance(wecom, dict):
+        return issues + ["`wecom` 不是对象"]
+
+    envs = wecom.get("environments")
+    if not isinstance(envs, dict) or not envs:
+        if wecom.get("corpid") or wecom.get("agentid"):
+            issues.append(
+                "`wecom` 是扁平结构（corpid/agentid 直接写在顶层）——"
+                "必须放进 `wecom.environments.<环境名>` 里"
+            )
+        else:
+            issues.append("`wecom.environments` 缺失或为空")
+        return issues
+
+    for name in sorted(envs):
+        entry = envs[name]
+        if not isinstance(entry, dict):
+            issues.append("环境 %r 不是对象" % name)
+            continue
+        if not str(entry.get("corpid") or "").strip():
+            issues.append("环境 %r 缺 corpid" % name)
+        if not str(entry.get("agentid") or "").strip():
+            issues.append("环境 %r 缺 agentid" % name)
+
+    default = wecom.get("default")
+    if not default:
+        issues.append("`wecom.default` 未设——每次调用都得显式 --env")
+    elif default not in envs:
+        issues.append("`wecom.default` 指向不存在的环境 %r" % default)
+    return issues
+
+
+def write_shared(path, payload):
+    """写 agent 也要读的文件：保留原权限，新建按 644。不要用 write_private——
+    那会把它改成 600，agent 就读不到了。"""
+    mode = 0o644
+    if os.path.exists(path):
+        mode = os.stat(path).st_mode & 0o777
+    temp = path + ".tmp"
+    with open(temp, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False, indent=2)
+        handle.write("\n")
+    os.chmod(temp, mode)
+    os.replace(temp, path)
+
+
 def resolve_env(project, env_name=None):
     """(env 名, corpid, agentid, label)。默认环境由配置决定，不由模型猜。"""
     wecom = project.get("wecom") or {}
@@ -441,6 +502,71 @@ def cmd_env(args):
         print("  关联会话：%s" % (", ".join(chats) if chats else "（无）"))
 
 
+def cmd_bind(args):
+    """把 corpid/agentid 写进项目配置。
+
+    存在的理由：这个结构原来是让模型照着 SKILL.md 手拼 JSON 的，实测它发明了
+    `wecom_app` 这么个键名和扁平结构，写完看起来像配好了、实际脚本读不到。
+    结构该由代码保证，不该由散文模板保证。
+    """
+    data = read_json(CONTEXT_MAP, "项目上下文")
+    projects = data.get("projects") or []
+    if not any(p.get("id") == args.project for p in projects):
+        raise WecomError(
+            "project_context_map 里没有项目 %r。可选：%s"
+            % (args.project, ", ".join(sorted(p.get("id", "?") for p in projects)))
+        )
+
+    entry = {"corpid": args.corpid.strip(), "agentid": str(args.agentid).strip()}
+    if args.label:
+        entry["label"] = args.label
+
+    dropped = []
+
+    def updated(project):
+        if project.get("id") != args.project:
+            return project
+        old = project.get("wecom") if isinstance(project.get("wecom"), dict) else {}
+        envs = dict(old.get("environments") or {})
+        envs[args.env] = entry
+        default = args.env if (args.make_default or not old.get("default")) else old["default"]
+        rebuilt = {**project, "wecom": {"default": default, "environments": envs}}
+        if args.drop_legacy:
+            # 只删已知的死键名，且只在这个项目上，写之前已经备份。
+            for key in NEAR_MISS_KEYS:
+                if key in rebuilt:
+                    del rebuilt[key]
+                    dropped.append(key)
+        return rebuilt
+
+    backup = "%s.bak.%s" % (CONTEXT_MAP, time.strftime("%Y%m%d-%H%M%S"))
+    with open(CONTEXT_MAP, encoding="utf-8") as src, open(backup, "w", encoding="utf-8") as dst:
+        dst.write(src.read())
+
+    write_shared(CONTEXT_MAP, {**data, "projects": [updated(p) for p in projects]})
+
+    print("已写入项目 %s 的环境 %r：corpid=%s 应用=%s"
+          % (args.project, args.env, entry["corpid"], entry["agentid"]))
+    if dropped:
+        print("已删除失效的旧键：%s" % "、".join(dropped))
+    print("备份：%s" % backup)
+
+    project = next(p for p in read_json(CONTEXT_MAP, "项目上下文")["projects"]
+                   if p.get("id") == args.project)
+    issues = project_wecom_issues(project)
+    if issues:
+        print()
+        print("⚠️ 结构体检还有问题：")
+        for issue in issues:
+            print("  - %s" % issue)
+    else:
+        print("结构体检通过。")
+    print()
+    print("secret 另外配（不经过聊天）：")
+    print("  echo -n '<secret>' | %s set-secret --corpid %s --agentid %s"
+          % (sys.argv[0], entry["corpid"], entry["agentid"]))
+
+
 def cmd_set_secret(args):
     """secret 从标准输入读，不走命令行参数——argv 会进 ps 和 shell history。"""
     secret = sys.stdin.read().strip()
@@ -474,6 +600,26 @@ def cmd_doctor(args):
     print("token 缓存：%s  %s" % (TOKEN_CACHE, "存在" if os.path.exists(TOKEN_CACHE) else "尚未生成"))
     print()
     cmd_env(args)
+
+    print()
+    print("======== 结构体检 ========")
+    context_map = read_json(CONTEXT_MAP, "项目上下文")
+    problems = 0
+    for project in context_map.get("projects") or []:
+        issues = project_wecom_issues(project)
+        if not issues:
+            continue
+        problems += 1
+        print("  【%s】" % project.get("id"))
+        for issue in issues:
+            print("    ⚠️ %s" % issue)
+    if problems == 0:
+        print("  没发现结构问题。")
+    else:
+        print()
+        print("  用 `bind` 写配置，别手改 JSON：")
+        print("    %s bind --project <id> --env test --corpid ww… --agentid 100" % sys.argv[0])
+
     print()
     print("以上只检查接线，没有调用任何企微接口。要验证凭据可用，随便 call 一个只读接口。")
 
@@ -509,6 +655,19 @@ def build_parser():
 
     doctor = subparsers.add_parser("doctor", help="检查配置接线，不调接口")
     doctor.set_defaults(func=cmd_doctor)
+
+    bind = subparsers.add_parser("bind", help="把 corpid/agentid 写进项目配置（别手改 JSON）")
+    bind.add_argument("--project", required=True, help="project_context_map 里的项目 id")
+    bind.add_argument("--env", required=True, help="环境名，如 test / prod")
+    bind.add_argument("--corpid", required=True)
+    bind.add_argument("--agentid", required=True)
+    bind.add_argument("--label", help="人看的名字，如「测试应用」")
+    bind.add_argument("--make-default", action="store_true", help="把这个环境设为默认")
+    bind.add_argument(
+        "--drop-legacy", action="store_true",
+        help="顺手删掉该项目下失效的旧键名（wecom_app 之类）。写前会备份",
+    )
+    bind.set_defaults(func=cmd_bind)
 
     set_secret = subparsers.add_parser("set-secret", help="从标准输入写入应用 secret")
     set_secret.add_argument("--corpid", required=True)
