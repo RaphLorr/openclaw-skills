@@ -89,14 +89,32 @@ def read_json(path, what):
 
 
 def normalize_chat_id(value):
-    """归一化会话 id：`openclaw-weixin:group:X@chatroom` 和裸 `X@chatroom` 视为同一个。
+    """归一化成 `kind:id`，kind ∈ {group, direct}。
 
-    agent 上下文里给的是全限定形式，人手敲的往往只有群号，两种都得认。
+    agent 上下文里给的是 `openclaw-weixin:group:X@chatroom` 或
+    `openclaw-weixin:direct:<wxid>`，人手敲的往往只有群号或 wxid，两种都得认。
+
+    **kind 必须参与比对**：群和私聊是两条独立的授权链路，把 kind 丢掉就等于
+    默认「能私聊我的人 == 群里的人」，这个等号不成立。
     """
-    raw = (value or "").strip()
+    raw = (value or "").strip().lower()
     if not raw:
         return ""
-    return raw.rsplit(":", 1)[-1].lower()
+
+    parts = [p for p in raw.split(":") if p]
+    if len(parts) >= 2:
+        kind, ident = parts[-2], parts[-1]
+    else:
+        # 裸形式：按 id 长相推断
+        ident = parts[0] if parts else ""
+        kind = "group" if ident.endswith("@chatroom") else "direct"
+
+    if kind in ("dm", "direct", "peer"):
+        kind = "direct"
+    elif kind not in ("group",):
+        # 形如 `openclaw-weixin:X@chatroom` 这种缺 kind 的，按 id 长相推断
+        kind = "group" if ident.endswith("@chatroom") else "direct"
+    return "%s:%s" % (kind, ident)
 
 
 def find_project(context_map, project_id=None, chat_id=None, unbound=False):
@@ -141,14 +159,33 @@ def find_project(context_map, project_id=None, chat_id=None, unbound=False):
     if not bound:
         raise WecomError(
             "会话 %r 没有绑定任何配了 wecom 的项目，拒绝调用。\n"
-            "要让这个会话能用企微接口，先在 project_context_map.json 里把它关联到项目。"
+            "要让这个会话能用企微接口，先在 project_context_map.json 的 contexts 里\n"
+            "把它关联到项目。私聊也一样——能私聊 bot 不等于能查企微。"
             % chat_id
         )
-    if len({p.get("id") for p in bound}) > 1:
-        raise WecomError(
-            "会话 %r 绑定了多个配了 wecom 的项目（%s），拒绝猜测。请拆分绑定。"
-            % (chat_id, ", ".join(sorted(p.get("id", "?") for p in bound)))
-        )
+
+    by_bound_id = {p.get("id"): p for p in bound}
+    is_dm = wanted.startswith("direct:")
+
+    if len(by_bound_id) > 1:
+        # 私聊可以绑多个项目（一个人对接多个客户），但必须自己点名，不猜。
+        # 群不行：一个群对应一个项目，让模型在群里选项目等于把选择权交给群成员。
+        if not is_dm:
+            raise WecomError(
+                "群 %r 绑定了多个配了 wecom 的项目（%s），拒绝猜测。一个群只该对应一个项目。"
+                % (chat_id, ", ".join(sorted(by_bound_id)))
+            )
+        if not project_id:
+            raise WecomError(
+                "私聊 %r 绑定了多个项目，必须用 --project 明确指定。可选：%s"
+                % (chat_id, ", ".join(sorted(by_bound_id)))
+            )
+        if project_id not in by_bound_id:
+            raise WecomError(
+                "私聊 %r 没有绑定项目 %r，拒绝调用。已绑定：%s"
+                % (chat_id, project_id, ", ".join(sorted(by_bound_id)))
+            )
+        return by_bound_id[project_id], "bound-dm"
 
     project = bound[0]
     # 两个都给时必须一致——否则就是拿甲会话的 id 去换乙项目的凭据。
@@ -157,7 +194,7 @@ def find_project(context_map, project_id=None, chat_id=None, unbound=False):
             "会话 %r 绑定的是项目 %r，不是 %r。拒绝调用。"
             % (chat_id, project.get("id"), project_id)
         )
-    return project, "bound"
+    return project, "bound-dm" if is_dm else "bound"
 
 
 def resolve_env(project, env_name=None):
