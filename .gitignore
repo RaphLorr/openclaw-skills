@@ -7,6 +7,7 @@
 !reminder/
 !tapd/
 !wecom-api/
+!code-report/
 
 # 依赖与杂项
 node_modules/
