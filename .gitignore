@@ -8,6 +8,7 @@
 !tapd/
 !wecom-api/
 !code-report/
+!digibridge-meeting/
 
 # 依赖与杂项
 node_modules/
