@@ -204,7 +204,8 @@ description 支持 **Markdown**，MCP 会自动渲染成 HTML 再写进 TAPD。�
 ## 查询 Ticket
 
 ### 默认筛选
-- 只查未关闭的 Ticket
+- 默认只查未关闭的 Ticket；Story/Bug 的结束状态按当前项目和需求类别查询，
+  不用固定的 `closed` / `end` 过滤。规则见 [工作流与状态](references/workflows.md)。
 
 ### 列表展示格式
 每条 Ticket 显示：
@@ -225,42 +226,22 @@ description 支持 **Markdown**，MCP 会自动渲染成 HTML 再写进 TAPD。�
 ## 更新 Ticket
 
 ### 行动原则
-用户说"修好了"→ 直接查工作流 → 直接流转状态 → 直接补评论 → 返回结果。整个过程一气呵成，中间不要问任何确认。
-不要问"要不要更新"、不要问"要更新到哪个状态"、不要问"要不要补评论"。这些全部自动完成。
+用户明确要求“关闭”“修好了”“重新打开”时，按其意图查询本票工作流。
+目标与直接流转唯一且符合已有事实时，执行更新并补评论，不重复询问授权。
+多个合理目标、必须经过尚未完成的验证步骤或配置异常时，先说明具体阻碍再澄清。
 
 ### 状态流转规则
 
-#### Bug Happy Path
-
-new(新) → in_progress(接受/处理) → resolved(已解决) → verified(已验证) → closed(已关闭)
-
-其他常见流转：
-- 任何状态 → rejected(已拒绝)：拒绝 bug
-- rejected → closed(已关闭)：关闭已拒绝的 bug
-- closed/rejected/resolved → reopened(重新打开)：重新打开
-
-使用 `v_status` 传中文名，如 `v_status: "已关闭"`。
-
-#### Story/需求 Happy Path
-
-planning(规划中) → developing(开发中) → status_3(测试中) → resolved(已实现) → end
-
-其他常见流转：
-- planning/developing → rejected(已拒绝)：拒绝需求
-- rejected → planning(规划中)：重新规划
-- rejected/resolved → end：归档结束
-
-使用 `v_status` 传中文名，如 `v_status: "开发中"`。注意：测试中对应 `v_status: "测试中"`，归档对应 `status: "end"`（无中文别名时用英文 key）。
-
-#### 遇到问题时
-
-如果 `v_status` 更新失败（状态名不匹配或当前状态不允许该流转）：
-1. 调 `get_workflows_all_transitions` 查当前可用的流转路径（返回英文 key）
-2. 用 `status` 字段传英文 key 重试（如 `status: "closed"`）
-3. 如果仍然失败，列出可用的目标状态让用户选择
+修改 Story/Bug 状态、判断是否已结束或筛选未关闭工单前，阅读
+[工作流与状态](references/workflows.md)。先读票据的当前状态和需求类别，再查询
+`get_workflows_status_map`、`get_workflows_last_steps`、`get_workflows_all_transitions`。
+不维护跨项目通用流程，不把流转表中的 `end` 自动当成业务状态。
+Task 使用独立任务接口，不套用 Story/Bug 的工作流。
 
 ### 评论规则（状态变更时自动执行，不要询问）
-任何状态变更都必须同时用 `create_comments` 添加评论，不要单独询问用户是否需要评论。
+更新成功并回读确认状态后，用 `create_comments` 补充一次变更依据，不单独询问是否补评论。
+更新被拒绝或结果未确认时，不写“已关闭/已完成”的成功评论。
+状态已更新但评论失败时分别报告结果，后续只补评论，不重复流转。
 评论内容：
 - 以 "[AI Bot]" 开头，标明来源
 - 整理对话中与该 Ticket 相关的讨论，提炼关键信息
