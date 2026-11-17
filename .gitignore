@@ -9,6 +9,7 @@
 !wecom-api/
 !code-report/
 !digibridge-meeting/
+!product-support/
 
 # 依赖与杂项
 node_modules/

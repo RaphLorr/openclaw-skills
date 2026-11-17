@@ -16,6 +16,7 @@
 | `code-report` | 代码问题的诊断结论 → 排版好的图片发进群（微信不渲染 markdown，代码贴文本没法读） |
 | `wecom-api` | 企业微信服务端接口 —— 查外部联系人身份与跟进关系，按需调用任意原生接口 |
 | `digibridge-meeting` | 内部会议：人员解析、原生 repeat 邀请、按需托管会议室滚动预约、部分结果及取消限制 |
+| `product-support` | 基于本群关联代码的产品客服：业务语言解释、未关联时的回复/静默门槛、明确改进诉求交接 TAPD 许愿池 |
 
 会议 skill 的运行副本位于服务器 `~/.openclaw/workspace/skills/digibridge-meeting/`。
 本仓库只保存 skill 文档及 schema 说明，不保存联系人数据、运行配置、API key、secret 或 token。

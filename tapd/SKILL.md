@@ -1,6 +1,6 @@
 ---
 name: tapd
-description: TAPD 项目管理：创建、查询、更新 Bug、Story/需求及 Sprint/迭代。用于建票、指派、状态流转、附件和迭代规划；按工作计划日期匹配迭代，无匹配时先确认是否按周一至周日的一周创建，再关联建票。写操作前完整阅读本 skill 的人员映射、去重、签名、附件和确认规则。
+description: TAPD 项目管理：创建、查询、更新 Bug、Story/需求及 Sprint/迭代。用于建票、状态流转、附件、迭代规划，以及微信群 @机器人提出明确产品改进建议时自动收录许愿池 BACKLOG，无需另说“建票”。许愿池可自动补建 BACKLOG；普通周迭代仍须确认。写操作前阅读项目归属、来源记录、去重和签名规则。
 ---
 
 # TAPD Ticket Management
@@ -17,7 +17,11 @@ description: TAPD 项目管理：创建、查询、更新 Bug、Story/需求及 
 ## 通用规则
 
 - 所有输出中不要显示原始数字 ID，用 TAPD 链接代替
-- 用 memory 记住每个群/会话对应的 TAPD 项目，避免重复询问
+- 微信群的 TAPD 项目以 `/root/.openclaw/workspace/data/project_context_map.json` 为准：
+  用可信的当前群 ID 匹配 `contexts[].chat_id`，沿 `project_ids` 找到 `projects[].tapd.workspace_id`，
+  去重后只有一个项目才可自动写入。缺失、冲突或文件不可读时停止并澄清，不按群名、memory 或旧对话猜项目，
+  不擅自修改映射。当前 OpenClaw `wechat_project` 是代码仓库工具，不调用 Hermes 专有的 `project` 动作。
+  私聊使用用户明确指定的项目/工单链接，未明确时确认一次，不把某个群项目作为私聊全局默认。
 - 简洁行动，不要反复确认显而易见的操作
 - 涉及 owner、current_owner、developer、te、participator 等 TAPD 成员昵称字段时，必须先从 `/root/.openclaw/workspace/data/contact_map.json` 查找对应人员并取 `wecom.name`。如果在 contact_map 中找不到该人员（无论用户说的是英文名、中文名、昵称还是别名），必须停下来向用户确认此人的企业微信中文姓名，不要猜测、不要用 alias 凑、不要直接使用用户提供的名字作为 TAPD 字段值
 - TAPD API 的 author 字段不可控（由授权令牌的固定用户决定），不要尝试传入或修改 author。用 [AI Bot] 签名来标识操作来源，不要纠结 TAPD 显示的作者名
@@ -83,10 +87,28 @@ MCP server 内部会自动把该文件上传到 TAPD 自己的图床，再把图
 
 ---
 
+## 产品建议许愿池
+
+“怎么用/为什么这样”本身是咨询，先按 [产品咨询](../product-support/SKILL.md) 查证和解释，
+不因客服回复命中 TAPD 就建票；后续明确的改动诉求才进入许愿池。
+
+在已关联唯一 TAPD 项目的微信群，用户 @机器人提出明确产品改进建议时，
+即使没有说“建票”，也主动查重并收录为 Story，放入名称为 `BACKLOG` 的迭代。
+这是本 skill 的默认行为，不要求新增群开关。提问、玩笑、未形成明确诉求的讨论不自动建票；
+用户明确说“先讨论/不用记录”时不写入。未 @ 的消息不保证触发；不修改群消息模式。
+
+执行前阅读 [许愿池流程](references/wishlist.md)：明确的重复需求追加来源，疑似重复先澄清；
+记录谁在何时提出什么，不把提出人自动设为负责人，不承诺排期。
+BACKLOG 不存在时已授权自动补建，无须逐次确认；容器日期默认创建当天至一年后的同一日。
+该规则优先于下文普通建票的周迭代选择及补建确认，其他建票流程不变。
+
+---
+
 ## 创建 Ticket（Bug / Story）
 
 ### 去重检查（必须）
 创建前，先查询当前项目未关闭的同类 Ticket，对比标题和描述是否有相似的。
+许愿池的明确重复反馈按 [许愿池流程](references/wishlist.md) 追加来源；下列确认规则适用于其余疑似重复。
 - Bug: 用 `get_bug` 查询
 - Story: 用 `get_stories` 查询
 - 如果发现疑似重复，列出相似的 Ticket（标题、状态、处理人、链接），问用户："这几个看起来相关，还要新建吗？"
@@ -114,6 +136,9 @@ MCP 会自动上传到 TAPD 图床并内嵌进描述，不需要外部图床，�
 不要静默跳过附件，更不要谎称已附上。
 
 ### 迭代关联（必须）
+
+许愿池只查找或补建 `BACKLOG`，按 [许愿池流程](references/wishlist.md) 执行，不按本周/下周匹配。
+以下规则用于其余普通建票。
 
 **按用户指定的迭代或工作计划日期选，不按“最新”选。** 先确认当前日期和项目时区，具体流程见 [Sprint 管理](references/sprints.md)。
 
