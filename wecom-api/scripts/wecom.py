@@ -18,6 +18,7 @@ import fcntl
 import http.client
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -352,6 +353,8 @@ def egress_transport(name, profile):
     所以「绑定哪个本地地址」就等于「走不走隧道」。不需要额外的代理进程。
     """
     source_ip = (profile.get("source_ip") or "").strip()
+    if source_ip == "auto":
+        return {"source_ip": discover_ipsec_source(name, profile)}
     if source_ip:
         return {"source_ip": source_ip}
 
@@ -414,8 +417,69 @@ def egress_is_up(profile):
     if not status:
         return False
     pattern = profile.get("ready_pattern") or "ESTABLISHED"
-    _, output = run_step(status, timeout=20)
-    return pattern in output
+    rc, output = run_step(status, timeout=20)
+    return rc == 0 and pattern in output
+
+
+def discover_ipsec_source(name, profile):
+    """Resolve only a named strongSwan tunnel; never guess from host addresses.
+
+    Require an installed full-tunnel CHILD_SA, a locally assigned IPv4 /32,
+    and its matching outbound kernel policy (including reqid). Ambiguity or
+    missing evidence fails closed; a stale configured address is not a fallback.
+    """
+    status = profile.get("status")
+    if (not isinstance(status, list) or not status
+            or os.path.basename(status[0]) != "swanctl"
+            or "--list-sas" not in status or "--ike" not in status):
+        raise WecomError("出口 %r 自动源地址需要按 --ike 指定隧道的 swanctl 状态命令" % name)
+    ike_index = status.index("--ike") + 1
+    if ike_index >= len(status) or status[ike_index].startswith("-"):
+        raise WecomError("出口 %r 的状态命令未指定隧道名" % name)
+    ike_name = status[ike_index]
+    rc, output = run_step(status, timeout=20)
+    if rc != 0:
+        raise WecomError("出口 %r 无法读取隧道状态，拒绝猜测源地址" % name)
+    candidates = set()
+    established = False
+    child_reqid = None
+    child_source = None
+    for line in output.splitlines():
+        if line and not line[0].isspace():
+            established = line.startswith(ike_name + ":") and ", ESTABLISHED," in line
+            child_reqid = child_source = None
+        elif re.match(r"^  \S", line):
+            child_reqid = child_source = None
+            match = re.search(r"reqid (\d+), INSTALLED, TUNNEL(?:[-,]|$)", line)
+            if established and match:
+                child_reqid = match.group(1)
+        elif child_reqid:
+            match = re.fullmatch(r"\s+local\s+(\d+\.\d+\.\d+\.\d+)/32\s*", line)
+            if match:
+                child_source = match.group(1)
+            if child_source and re.fullmatch(r"\s+remote\s+0\.0\.0\.0/0\s*", line):
+                candidates.add((child_source, child_reqid))
+    rc, policies = run_step(["ip", "-4", "xfrm", "policy"], timeout=10)
+    if rc != 0:
+        raise WecomError("出口 %r 无法核对 IPsec 出向策略，拒绝使用源地址" % name)
+    local = local_addresses()
+    verified = set()
+    for block in re.split(r"(?=^src )", policies, flags=re.MULTILINE):
+        match = re.match(r"src (\d+\.\d+\.\d+\.\d+)/32 dst 0\.0\.0\.0/0\s", block)
+        if not match or not re.search(r"\bdir out\b", block):
+            continue
+        source = match.group(1)
+        if source in local and any(
+                source == addr and re.search(r"\breqid " + re.escape(reqid) + r"\b.*\bmode tunnel\b", block)
+                for addr, reqid in candidates):
+            verified.add(source)
+    if len(verified) != 1:
+        raise WecomError(
+            "出口 %r 自动源地址核验失败（有效地址数 %d），拒绝直连或猜测地址"
+            % (name, len(verified)))
+    source = verified.pop()
+    audit("egress resolved-source name=%s ip=%s" % (name, source))
+    return source
 
 
 def acquire_egress(name):
@@ -434,9 +498,8 @@ def acquire_egress(name):
     if profile.get("type") == "direct":
         return None
 
-    transport = egress_transport(name, profile)
     if not profile.get("up"):
-        return transport  # 常驻线路，不需要拨号
+        return egress_transport(name, profile)  # 常驻线路，不需要拨号
 
     with EgressLock(EGRESS_LOCK):
         if not egress_is_up(profile):
@@ -449,6 +512,8 @@ def acquire_egress(name):
                     "%s\n提示：账号是共享单会话的，可能有人正占着。"
                     % (name, rc, output.strip()[:500])
                 )
+        # 必须在拨号完成后解析实时地址，不能使用拨号前的旧租约。
+        transport = egress_transport(name, profile)
         # 拨上了还要确认源地址真的在本机——地址不在就绑不上，而绑不上
         # 又不能退回默认源地址（那就从错误的 IP 发出去了）。
         source_ip = transport.get("source_ip")
@@ -891,7 +956,9 @@ def cmd_doctor(args):
             where = profile.get("source_ip") or profile.get("url") or profile.get("type") or "?"
             dial = "按需拨号" if profile.get("up") else "常驻"
             live = ""
-            if profile.get("source_ip"):
+            if profile.get("source_ip") == "auto":
+                live = "（按指定 IPsec 隧道实时解析并核对出向策略）"
+            elif profile.get("source_ip"):
                 live = "（地址在本机）" if profile["source_ip"] in local_addresses() else "（地址不在本机→未拨通）"
             print("  - %-22s %-16s %s %s %s"
                   % (name, where, dial, live, profile.get("note") or ""))
