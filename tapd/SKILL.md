@@ -1,6 +1,6 @@
 ---
 name: tapd
-description: TAPD 项目管理：创建、查询、更新 Bug、Story/需求及 Sprint/迭代。用于建票、状态流转、附件、迭代规划，以及微信群 @机器人提出明确产品改进建议时自动收录许愿池 BACKLOG，无需另说“建票”。许愿池可自动补建 BACKLOG；普通周迭代仍须确认。写操作前阅读项目归属、来源记录、去重和签名规则。
+description: TAPD 项目管理：创建、查询、更新 Bug、Story/需求及 Sprint/迭代。用于建票、状态流转、下载或上传工单附件、迭代规划，以及微信群 @机器人提出明确产品改进建议时自动收录许愿池 BACKLOG，无需另说“建票”。许愿池可自动补建 BACKLOG；普通周迭代仍须确认。写操作前阅读项目归属、来源记录、去重和签名规则。
 ---
 
 # TAPD Ticket Management
@@ -40,6 +40,12 @@ description: TAPD 项目管理：创建、查询、更新 Bug、Story/需求及 
 - 优先使用 `/root/.openclaw/workspace/data/contact_map.json` 里的 `wecom.name` 作为 TAPD 处理人昵称来源，因为 TAPD 项目成员昵称通常与企业微信中文姓名一致
 - 如果用户说的是英文名、微信名、别名或邮箱，先映射到 contact_map 里的对应人员，再取该人员的 `wecom.name`
 - 如果用户指定的人在 contact_map 中找不到，不要继续创建，必须先追问用户确认此人的企业微信中文姓名
+
+### 从 TAPD 下载工单附件
+
+用户要求下载、读取或转存 TAPD 工单附件时，先用链接或项目查询确定工作项，再调用 `download_ticket_attachments`。传 `workspace_id`、完整 `entry_id` 和 `entity_type`（需求用 `story`，缺陷用 `bug`）。指定单个附件时可传 `attachment_id`；需要全部时，有 `next_page` 就继续。
+
+只用返回 `status=downloaded` 的 `local_path` 读取或交给目标工具，保留 `filename` 作为原文件名。逐份说明下载失败；微信文件搜索只用于用户另行指定的群文件。如果还要转存到仓库或其他目标，按目标工具的权限执行，只有写入确认后才说已转存。
 
 ### 媒体附件处理（图片/视频 — 自动执行，不要询问）
 
